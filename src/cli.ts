@@ -11,7 +11,9 @@ import { WebSocketClientTransport } from "./client/websocket.js";
 import { Server } from "./server/index.js";
 import { SSEServerTransport } from "./server/sse.js";
 import { StdioServerTransport } from "./server/stdio.js";
-import { ListResourcesResultSchema } from "./types.js";
+import { ListResourcesResultSchema, ListToolsRequestSchema, ListToolsResultSchema } from './types.js'
+import { McpServer, ResourceTemplate } from './server/mcp.js'
+import { z } from 'zod'
 
 async function runClient(url_or_command: string, args: string[]) {
   const client = new Client(
@@ -51,7 +53,11 @@ async function runClient(url_or_command: string, args: string[]) {
   await client.connect(clientTransport);
   console.log("Initialized.");
 
-  await client.request({ method: "resources/list" }, ListResourcesResultSchema);
+  const resources = await client.request({ method: "resources/list" }, ListResourcesResultSchema);
+  console.dir(resources, { depth: null })
+
+  const tools = await client.request({ method: "tools/list" }, ListToolsResultSchema);
+  console.dir(tools, { depth: null })
 
   await client.close();
   console.log("Closed.");
@@ -61,25 +67,40 @@ async function runServer(port: number | null) {
   if (port !== null) {
     const app = express();
 
-    let servers: Server[] = [];
+    let servers: McpServer[] = [];
 
     app.get("/sse", async (req, res) => {
       console.log("Got new SSE connection");
 
       const transport = new SSEServerTransport("/message", res);
-      const server = new Server(
+      const server = new McpServer(
         {
           name: "mcp-typescript test server",
           version: "0.1.0",
         },
-        {
-          capabilities: {},
-        },
+      );
+
+      server.resource(
+        "config",
+        "config://app",
+        async (uri) => ({
+          contents: [{
+            uri: uri.href,
+            text: "App configuration here"
+          }]
+        })
+      );
+
+      server.tool("add",
+        { a: z.number(), b: z.number() },
+        async ({ a, b }) => ({
+          content: [{ type: "text", text: String(a + b) }]
+        })
       );
 
       servers.push(server);
 
-      server.onclose = () => {
+      server.server.onclose = () => {
         console.log("SSE connection closed");
         servers = servers.filter((s) => s !== server);
       };
@@ -92,7 +113,7 @@ async function runServer(port: number | null) {
 
       const sessionId = req.query.sessionId as string;
       const transport = servers
-        .map((s) => s.transport as SSEServerTransport)
+        .map((s) => s.server.transport as SSEServerTransport)
         .find((t) => t.sessionId === sessionId);
       if (!transport) {
         res.status(404).send("Session not found");
