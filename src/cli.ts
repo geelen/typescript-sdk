@@ -67,10 +67,65 @@ async function runServer(port: number | null) {
   if (port !== null) {
     const app = express();
 
+    // Request logging middleware
+    app.use((req, res, next) => {
+      const start = Date.now();
+      const requestId = crypto.randomUUID();
+
+      console.log(`[${requestId}] ${new Date().toISOString()} - ${req.method} ${req.originalUrl} - Request received`);
+
+      // Log request headers if needed
+      console.log(`[${requestId}] Headers:`, JSON.stringify(req.headers, null, 2));
+
+      // Add response finish listener to log completion
+      res.on('finish', () => {
+        const duration = Date.now() - start;
+        console.log(`[${requestId}] ${new Date().toISOString()} - ${req.method} ${req.originalUrl} - Response sent - Status: ${res.statusCode} - Duration: ${duration}ms`);
+      });
+
+      next();
+    });
+
+    // Super permissive CORS middleware
+    app.use((req, res, next) => {
+      res.header('Access-Control-Allow-Origin', '*');
+      res.header('Access-Control-Allow-Headers', '*');
+      res.header('Access-Control-Allow-Methods', '*');
+      res.header('Access-Control-Allow-Credentials', 'true');
+      res.header('Access-Control-Max-Age', '86400'); // 24 hours
+
+      // Handle preflight requests
+      if (req.method === 'OPTIONS') {
+        return res.status(204).send();
+      }
+
+      next();
+    });
+
+
+    app.get('/.well-known/oauth-authorization-server', async (req, res) => {
+      res.json({
+        issuer: `https://dash.cloudflare.com`,
+        authorization_endpoint: `https://dash.cloudflare.com/oauth2/auth`,
+        token_endpoint: `https://dash.cloudflare.com/oauth2/token`,
+        token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
+        grant_types_supported: ['authorization_code', 'refresh_token'],
+        response_types_supported: ['code'],
+        scopes_supported: ['account:read', 'user:read', 'offline_access'],
+        response_modes_supported: ['query'],
+        revocation_endpoint: `https://dash.cloudflare.com/oauth2/token`,
+        code_challenge_methods_supported: ['plain', 'S256'],
+      })
+      return
+    })
+
     let servers: McpServer[] = [];
 
     app.get("/sse", async (req, res) => {
       console.log("Got new SSE connection");
+
+      res.status(401).send('Unauthorized');
+      return;
 
       const transport = new SSEServerTransport("/message", res);
       const server = new McpServer(
