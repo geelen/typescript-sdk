@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { requireBearerAuth } from "./bearerAuth.js";
 import { AuthInfo } from "../types.js";
-import { InsufficientScopeError, InvalidTokenError, OAuthError, ServerError } from "../errors.js";
+import { CustomOAuthError, InsufficientScopeError, InvalidTokenError, ServerError } from "../errors.js";
 import { OAuthServerProvider } from "../provider.js";
 import { OAuthRegisteredClientsStore } from "../clients.js";
 
@@ -59,7 +59,7 @@ describe("requireBearerAuth middleware", () => {
     expect(mockResponse.status).not.toHaveBeenCalled();
     expect(mockResponse.json).not.toHaveBeenCalled();
   });
-  
+
   it("should reject expired tokens", async () => {
     const expiredAuthInfo: AuthInfo = {
       token: "expired-token",
@@ -87,7 +87,7 @@ describe("requireBearerAuth middleware", () => {
     );
     expect(nextFunction).not.toHaveBeenCalled();
   });
-  
+
   it("should accept non-expired tokens", async () => {
     const nonExpiredAuthInfo: AuthInfo = {
       token: "valid-token",
@@ -274,7 +274,7 @@ describe("requireBearerAuth middleware", () => {
       authorization: "Bearer valid-token",
     };
 
-    mockVerifyAccessToken.mockRejectedValue(new OAuthError("custom_error", "Some OAuth error"));
+    mockVerifyAccessToken.mockRejectedValue(new CustomOAuthError("custom_error", "Some OAuth error"));
 
     const middleware = requireBearerAuth({ provider: mockProvider });
     await middleware(mockRequest as Request, mockResponse as Response, nextFunction);
