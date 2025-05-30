@@ -1,7 +1,26 @@
 import pkceChallenge from "pkce-challenge";
 import { LATEST_PROTOCOL_VERSION } from "../types.js";
-import type { OAuthClientMetadata, OAuthClientInformation, OAuthTokens, OAuthMetadata, OAuthClientInformationFull } from "../shared/auth.js";
-import { OAuthClientInformationFullSchema, OAuthMetadataSchema, OAuthTokensSchema } from "../shared/auth.js";
+import type {
+  OAuthClientInformation,
+  OAuthClientInformationFull,
+  OAuthClientMetadata,
+  OAuthMetadata,
+  OAuthTokens
+} from "../shared/auth.js";
+import {
+  OAuthClientInformationFullSchema,
+  OAuthErrorResponseSchema,
+  OAuthMetadataSchema,
+  OAuthTokensSchema
+} from "../shared/auth.js";
+import {
+  InvalidClientError,
+  InvalidGrantError,
+  OAUTH_ERRORS,
+  OAuthError,
+  ServerError,
+  UnauthorizedClientError
+} from "../server/auth/errors.js";
 
 /**
  * Implements an end-to-end OAuth client to be used with one MCP server.
@@ -66,6 +85,13 @@ export interface OAuthClientProvider {
    * the authorization result.
    */
   codeVerifier(): string | Promise<string>;
+
+  /**
+   * If implemented, provides a way for the client to invalidate (e.g. delete) the specified
+   * credentials, in the case where the server has indicated that they are no longer valid.
+   * This avoids requiring the user to intervene manually.
+   */
+  invalidateCredentials?(scope: 'all' | 'client' | 'tokens' | 'verifier'): void | Promise<void>;
 }
 
 export type AuthResult = "AUTHORIZED" | "REDIRECT";
@@ -77,6 +103,33 @@ export class UnauthorizedError extends Error {
 }
 
 /**
+ * Parses an OAuth error response from a string or Response object.
+ *
+ * If the input is a standard OAuth2.0 error response, it will be parsed according to the spec
+ * and an instance of the appropriate OAuthError subclass will be returned.
+ * If parsing fails, it falls back to a generic ServerError that includes
+ * the response status (if available) and original content.
+ *
+ * @param input - A Response object or string containing the error response
+ * @returns A Promise that resolves to an OAuthError instance
+ */
+export async function parseErrorResponse(input: Response | string): Promise<OAuthError> {
+  const statusCode = input instanceof Response ? input.status : undefined;
+  const body = input instanceof Response ? await input.text() : input;
+
+  try {
+    const result = OAuthErrorResponseSchema.parse(JSON.parse(body));
+    const { error, error_description, error_uri } = result;
+    const errorClass = OAUTH_ERRORS[error] || ServerError;
+    return new errorClass(error_description || '', error_uri);
+  } catch (error) {
+    // Not a valid OAuth error response, but try to inform the user of the raw data anyway
+    const errorMessage = `${statusCode ? `HTTP ${statusCode}: ` : ''}Invalid OAuth error response: ${error}. Raw body: ${body}`;
+    return new ServerError(errorMessage);
+  }
+}
+
+/**
  * Orchestrates the full auth flow with a server.
  * 
  * This can be used as a single entry point for all authorization functionality,
@@ -84,74 +137,102 @@ export class UnauthorizedError extends Error {
  */
 export async function auth(
   provider: OAuthClientProvider,
-  { serverUrl, authorizationCode }: { serverUrl: string | URL, authorizationCode?: string }): Promise<AuthResult> {
-  const metadata = await discoverOAuthMetadata(serverUrl);
+  options: { serverUrl: string | URL, authorizationCode?: string },
+  lastError?: Error
+): Promise<AuthResult> {
+  const { serverUrl, authorizationCode } = options
+  try {
+    const metadata = await discoverOAuthMetadata(serverUrl);
 
-  // Handle client registration if needed
-  let clientInformation = await Promise.resolve(provider.clientInformation());
-  if (!clientInformation) {
-    if (authorizationCode !== undefined) {
-      throw new Error("Existing OAuth client information is required when exchanging an authorization code");
-    }
+    // Handle client registration if needed
+    let clientInformation = await Promise.resolve(provider.clientInformation());
+    if (!clientInformation) {
+      if (authorizationCode !== undefined) {
+        throw new Error("Existing OAuth client information is required when exchanging an authorization code");
+      }
 
-    if (!provider.saveClientInformation) {
-      throw new Error("OAuth client information must be saveable for dynamic registration");
-    }
+      if (!provider.saveClientInformation) {
+        throw new Error("OAuth client information must be saveable for dynamic registration");
+      }
 
-    const fullInformation = await registerClient(serverUrl, {
-      metadata,
-      clientMetadata: provider.clientMetadata,
-    });
-
-    await provider.saveClientInformation(fullInformation);
-    clientInformation = fullInformation;
-  }
-
-  // Exchange authorization code for tokens
-  if (authorizationCode !== undefined) {
-    const codeVerifier = await provider.codeVerifier();
-    const tokens = await exchangeAuthorization(serverUrl, {
-      metadata,
-      clientInformation,
-      authorizationCode,
-      codeVerifier,
-      redirectUri: provider.redirectUrl,
-    });
-
-    await provider.saveTokens(tokens);
-    return "AUTHORIZED";
-  }
-
-  const tokens = await provider.tokens();
-
-  // Handle token refresh or new authorization
-  if (tokens?.refresh_token) {
-    try {
-      // Attempt to refresh the token
-      const newTokens = await refreshAuthorization(serverUrl, {
+      const fullInformation = await registerClient(serverUrl, {
         metadata,
-        clientInformation,
-        refreshToken: tokens.refresh_token,
+        clientMetadata: provider.clientMetadata,
       });
 
-      await provider.saveTokens(newTokens);
+      await provider.saveClientInformation(fullInformation);
+      clientInformation = fullInformation;
+    }
+
+    // Exchange authorization code for tokens
+    if (authorizationCode !== undefined) {
+      const codeVerifier = await provider.codeVerifier();
+      const tokens = await exchangeAuthorization(serverUrl, {
+        metadata,
+        clientInformation,
+        authorizationCode,
+        codeVerifier,
+        redirectUri: provider.redirectUrl,
+      });
+
+      await provider.saveTokens(tokens);
       return "AUTHORIZED";
-    } catch (error) {
-      console.error("Could not refresh OAuth tokens:", error);
+    }
+
+    const tokens = await provider.tokens();
+
+    // Handle token refresh or new authorization
+    if (tokens?.refresh_token) {
+      try {
+        // Attempt to refresh the token
+        const newTokens = await refreshAuthorization(serverUrl, {
+          metadata,
+          clientInformation,
+          refreshToken: tokens.refresh_token,
+        });
+
+        await provider.saveTokens(newTokens);
+        return "AUTHORIZED";
+      } catch (error) {
+        // If this is a ServerError, or an unknown type, log it out and try to continue. Otherwise, escalate so we can fix things and retry.
+        if (!(error instanceof OAuthError) || error instanceof ServerError) {
+          console.error("Could not refresh OAuth tokens:", error);
+        } else {
+          console.warn(`OAuth token refresh failed: ${JSON.stringify(error.toResponseObject())}`);
+          throw error
+        }
+      }
+    }
+
+    // Start new authorization flow
+    const {authorizationUrl, codeVerifier} = await startAuthorization(serverUrl, {
+      metadata,
+      clientInformation,
+      redirectUrl: provider.redirectUrl,
+      scope: provider.clientMetadata.scope
+    });
+
+    await provider.saveCodeVerifier(codeVerifier);
+    await provider.redirectToAuthorization(authorizationUrl);
+    return "REDIRECT";
+  } catch (error) {
+    switch ((error as Error).constructor) {
+      // Don't loop forever if the same type of error recurs
+      case lastError?.constructor:
+        throw error;
+      // Invalid clients mean the entire local state is now invalid, so clear it all then retry
+      case InvalidClientError:
+      case UnauthorizedClientError:
+        await provider.invalidateCredentials?.('all')
+        return await auth(provider, options, error as Error)
+      // Invalid grants mean clear the tokens and retry
+      case InvalidGrantError:
+        await provider.invalidateCredentials?.('tokens')
+        return await auth(provider, options, error as Error)
+      default:
+        throw error
     }
   }
-
-  // Start new authorization flow
-  const { authorizationUrl, codeVerifier } = await startAuthorization(serverUrl, {
-    metadata,
-    clientInformation,
-    redirectUrl: provider.redirectUrl,
-    scope: provider.clientMetadata.scope
-  });
-
-  await provider.saveCodeVerifier(codeVerifier);
-  await provider.redirectToAuthorization(authorizationUrl);
-  return "REDIRECT";
 }
 
 /**
@@ -316,7 +397,7 @@ export async function exchangeAuthorization(
   });
 
   if (!response.ok) {
-    throw new Error(`Token exchange failed: HTTP ${response.status}`);
+    throw await parseErrorResponse(response);
   }
 
   return OAuthTokensSchema.parse(await response.json());
@@ -375,7 +456,7 @@ export async function refreshAuthorization(
   });
 
   if (!response.ok) {
-    throw new Error(`Token refresh failed: HTTP ${response.status}`);
+    throw await parseErrorResponse(response);
   }
 
   return OAuthTokensSchema.parse(await response.json());
@@ -415,7 +496,7 @@ export async function registerClient(
   });
 
   if (!response.ok) {
-    throw new Error(`Dynamic client registration failed: HTTP ${response.status}`);
+    throw await parseErrorResponse(response);
   }
 
   return OAuthClientInformationFullSchema.parse(await response.json());
