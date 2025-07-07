@@ -56,6 +56,7 @@ export const DEFAULT_INHERITED_ENV_VARS =
         "TEMP",
         "USERNAME",
         "USERPROFILE",
+        "PROGRAMFILES",
       ]
     : /* list inspired by the default env inheritance of sudo */
       ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"];
@@ -182,6 +183,15 @@ export class StdioClientTransport implements Transport {
     }
 
     return this._process?.stderr ?? null;
+  }
+
+  /**
+   * The child process pid spawned by this transport.
+   *
+   * This is only available after the transport has been started.
+   */
+  get pid(): number | null {
+    return this._process?.pid ?? null;
   }
 
   private processReadBuffer() {
